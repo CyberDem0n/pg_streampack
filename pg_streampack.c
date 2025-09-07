@@ -584,7 +584,7 @@ _PG_init(void)
 							 &pg_streampack_client_requested,
 							 false,
 							 PGC_BACKEND,
-							 GUC_NO_SHOW_ALL,
+							 GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL,
 							 compression_requested_check_hook,
 							 NULL,
 							 NULL);

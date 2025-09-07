@@ -27,7 +27,7 @@ jobs:
       run: |
         set -e
         sudo apt-get update -y
-        sudo apt-get install -y curl ca-certificates gnupg liblz4-dev libkrb5-dev
+        sudo apt-get install -y curl ca-certificates gnupg liblz4-dev libkrb5-dev lcov
         sudo sh -c "echo \"deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main $PG\" > /etc/apt/sources.list.d/pgdg.list"
         sudo sh -c "curl -s -o - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg"
         sudo apt-get update -y
@@ -46,7 +46,15 @@ jobs:
       run: |
         make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck
 
+    - name: Generate lcov.info
+      run: |
+        gcc --version
+        gcov --version
+        gcov -lr *.c
+        lcov --capture --directory . --no-external -o lcov.info
+
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
+        flags: ${{ matrix.postgres-version }}
