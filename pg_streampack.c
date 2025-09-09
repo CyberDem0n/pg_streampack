@@ -487,8 +487,6 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 
 		*buffer = input_buf.data;
 	}
-	else if (*buffer && len > 1)
-		elog(LOG_SERVER_ONLY, "%c", **buffer);
 
 	return len;
 }
