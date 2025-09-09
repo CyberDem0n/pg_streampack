@@ -46,11 +46,10 @@ jobs:
 
     - name: Run tests
       run: |
-        make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck
+        make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck || (cat regression.diffs && false)
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         flags: ${{ matrix.postgres-version }}
-        gcov: true
