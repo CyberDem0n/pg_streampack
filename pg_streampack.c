@@ -211,6 +211,8 @@ attach_to_walsender(Port *port, int status)
  * Hackery to inject ourselves into walreceiver or logical replication worker
  * connections.
  */
+static walrcv_startstreaming_fn old_walrcv_startstreaming;
+static walrcv_endstreaming_fn old_walrcv_endstreaming;
 static walrcv_connect_fn old_walrcv_connect;
 static walrcv_receive_fn old_walrcv_receive;
 
@@ -226,6 +228,8 @@ struct WalReceiverConn
 	bool		logical;
 	/* Buffer for currently read records */
 	char	   *recvBuf;
+	/* Whether this connection is currently in streaming mode */
+	bool		streaming;
 };
 
 /*
@@ -423,12 +427,29 @@ bad_connection:
 	return NULL;
 }
 
+static bool
+libpqrcv_startstreaming(WalReceiverConn *conn,
+						const WalRcvStreamOptions *options)
+{
+	return conn->streaming = old_walrcv_startstreaming(conn, options);
+}
+
+static void
+libpqrcv_endstreaming(WalReceiverConn *conn, TimeLineID *next_tli)
+{
+	conn->streaming = false;
+	old_walrcv_endstreaming(conn, next_tli);
+}
+
 static int
 libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 				 pgsocket *wait_fd)
 {
 	static StringInfoData input_buf = {0,};
 	int len = old_walrcv_receive(conn, buffer, wait_fd);
+
+	if (!conn->streaming)
+		return len;
 
 	/* 'z' indicates that we received compressed message */
 	if (*buffer && len >= new_header_size && *buffer[0] == 'z')
@@ -466,6 +487,8 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 
 		*buffer = input_buf.data;
 	}
+	else if (*buffer && len > 1)
+		elog(LOG_SERVER_ONLY, "%c", **buffer);
 
 	return len;
 }
@@ -563,6 +586,12 @@ _PG_init(void)
 
 	old_walrcv_connect = WalReceiverFunctions->walrcv_connect;
 	WalReceiverFunctions->walrcv_connect = libpqrcv_connect;
+
+	old_walrcv_startstreaming = WalReceiverFunctions->walrcv_startstreaming;
+	WalReceiverFunctions->walrcv_startstreaming = libpqrcv_startstreaming;
+
+	old_walrcv_endstreaming = WalReceiverFunctions->walrcv_endstreaming;
+	WalReceiverFunctions->walrcv_endstreaming = libpqrcv_endstreaming;
 
 	old_walrcv_receive = WalReceiverFunctions->walrcv_receive;
 	WalReceiverFunctions->walrcv_receive = libpqrcv_receive;

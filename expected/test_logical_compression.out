@@ -17,11 +17,20 @@ WARNING:  subscription was created, but is not connected
 HINT:  To initiate replication, you must manually create the replication slot, enable the subscription, and refresh the subscription.
 ALTER SUBSCRIPTION test ENABLE;
 ALTER SUBSCRIPTION test REFRESH PUBLICATION;
-CREATE FUNCTION wait_subscription()
+CREATE FUNCTION wait_subscription(len bigint)
  RETURNS void AS $function$
 DECLARE
     loop_cnt int DEFAULT 0;
 BEGIN
+	WHILE (SELECT SUM(length(name)) FROM test) != len LOOP
+		SELECT SUM(length(name)) FROM test;
+        loop_cnt := loop_cnt + 1;
+        IF loop_cnt > 600 THEN
+            RAISE EXCEPTION 'Subscription did not caught up after 1 minute';
+        ELSE
+            PERFORM pg_sleep(0.1);
+        END IF;
+    END LOOP;
     LOOP
         PERFORM 1 FROM pg_stat_subscription
         WHERE pg_current_wal_lsn() - received_lsn = 0
@@ -36,31 +45,19 @@ BEGIN
     END LOOP;
 END
 $function$ LANGUAGE plpgsql;
-SELECT wait_subscription();
+SELECT wait_subscription(10155);
  wait_subscription 
 -------------------
  
-(1 row)
-
-SELECT SUM(length(name)) FROM test;
-  sum  
--------
- 10155
 (1 row)
 
 \c src
 UPDATE test SET name = name || name;
 \c dst
-SELECT wait_subscription();
+SELECT wait_subscription(20310);
  wait_subscription 
 -------------------
  
-(1 row)
-
-SELECT SUM(length(name)) FROM test;
-  sum  
--------
- 20310
 (1 row)
 
 DROP SUBSCRIPTION test;
