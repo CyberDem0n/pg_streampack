@@ -41,7 +41,16 @@ jobs:
         set -e
         make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 enable_coverage=yes
         sudo make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 install
+        make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 enable_coverage=yes with_llvm=no clean all
+        sudo make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 with_llvm=no install
 
     - name: Run tests
       run: |
         make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck
+
+    - name: Upload coverage reports to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: ${{ matrix.postgres-version }}
+        gcov: true
