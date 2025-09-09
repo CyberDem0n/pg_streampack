@@ -23,7 +23,6 @@ DECLARE
     loop_cnt int DEFAULT 0;
 BEGIN
 	WHILE (SELECT SUM(length(name)) FROM test) != len LOOP
-		SELECT SUM(length(name)) FROM test;
         loop_cnt := loop_cnt + 1;
         IF loop_cnt > 600 THEN
             RAISE EXCEPTION 'Subscription did not caught up after 1 minute';
