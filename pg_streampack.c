@@ -4,17 +4,14 @@
 
 #include "common/connect.h"
 #include "libpq/auth.h"
-#include "libpq-fe.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "libpq/libpq.h"
 #include "pqexpbuffer.h"
-#include "libpq/pqformat.h"
 #include "replication/walreceiver.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
 
@@ -622,7 +619,6 @@ libpqrcv_disconnect(WalReceiverConn *conn)
 
 	old_walrcv_disconnect(conn);
 }
-
 
 /* allow setting pg_streampack.requested only from client connection */
 static bool
