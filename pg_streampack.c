@@ -152,8 +152,8 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 {
 	pg_atomic_fetch_add_u64(&stats->total, len);
 
-	if (comp_ctx != NULL && pg_streampack_enabled &&
-		pg_streampack_client_requested && msgtype == 'd' &&
+	if (comp_ctx != NULL && msgtype == 'd' &&
+		pg_streampack_client_requested &&
 		len >= header_size + min_compress_size && s[0] == 'w')
 	{
 		uint64 net_ts;
@@ -259,7 +259,8 @@ attach_to_walsender(Port *port, int status)
 	if (original_client_auth_hook)
 		original_client_auth_hook(port, status);
 
-	if (am_walsender && (comp_ctx = init_comp_ctx()) != NULL)
+	if (am_walsender && pg_streampack_enabled &&
+		(comp_ctx = init_comp_ctx()) != NULL)
 	{
 		OldPqCommMethods = PqCommMethods;
 		PqCommMethods = &PqCommSocketMethods;
@@ -297,6 +298,8 @@ struct WalReceiverConn
 static void
 free_decomp_ctx(decompression_ctx *ctx)
 {
+	if (ctx == NULL)
+		return;
 	if (ctx->stream)
 		LZ4_freeStreamDecode(ctx->stream);
 	if (ctx->lz4_dict)
@@ -367,7 +370,7 @@ libpqrcv_connect(const char *conninfo,
 	bool		must_use_password = false;
 #endif
 	bool		uses_password = false;
-	decompression_ctx *ctx = init_decomp_ctx();
+	decompression_ctx *ctx = pg_streampack_enabled ? init_decomp_ctx() : NULL;
 
 	/*
 	 * We use the expand_dbname parameter to process the connection string (or
@@ -434,8 +437,7 @@ libpqrcv_connect(const char *conninfo,
 			 * match what pg_dump does.
 			 */
 			keys[++i] = "options";
-			vals[i] = pg_streampack_enabled && ctx != NULL ?
-				LOGICAL_OPTIONS " " COMPRESSION_OPTION : LOGICAL_OPTIONS;
+			vals[i] = ctx == NULL ? LOGICAL_OPTIONS : LOGICAL_OPTIONS " " COMPRESSION_OPTION;
 		}
 		else
 		{
@@ -445,7 +447,8 @@ libpqrcv_connect(const char *conninfo,
 			 */
 			keys[++i] = "dbname";
 			vals[i] = "replication";
-			if (pg_streampack_enabled && ctx != NULL)
+
+			if (ctx != NULL)
 			{
 				options = palloc0(1 + strlen(COMPRESSION_OPTION) +
 								  (conn_options ? strlen(conn_options) + 1 : 0));
@@ -530,8 +533,7 @@ bad_connection_errmsg:
 bad_connection:
 	libpqsrv_disconnect(conn->streamConn);
 	pfree(conn);
-	if (ctx != NULL)
-		free_decomp_ctx(ctx);
+	free_decomp_ctx(ctx);
 	return NULL;
 }
 
@@ -614,8 +616,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 static void
 libpqrcv_disconnect(WalReceiverConn *conn)
 {
-	if (conn->decomp_ctx)
-		free_decomp_ctx(conn->decomp_ctx);
+	free_decomp_ctx(conn->decomp_ctx);
 
 	old_walrcv_disconnect(conn);
 }
