@@ -20,6 +20,7 @@ PG_MODULE_MAGIC;
 
 PGDLLEXPORT void _PG_init(void);
 
+#define LZ4_DICT_SIZE 65536
 #define LOGICAL_OPTIONS "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3"
 #define COMPRESSION_OPTION "-c pg_streampack.requested=on"
 
@@ -37,6 +38,22 @@ static bool pg_streampack_client_requested = false;
 
 /* from which size we should try compressing messages. */
 static int min_compress_size;
+
+typedef struct
+{
+	PQExpBufferData *buf;
+	char *lz4_dict;
+	LZ4_stream_t *stream;
+} compression_ctx;
+
+static compression_ctx *comp_ctx = NULL;
+
+typedef struct
+{
+	PQExpBufferData *buf;
+	char *lz4_dict;
+	LZ4_streamDecode_t *stream;
+} decompression_ctx;
 
 /*
  * Collect some statistic.
@@ -62,6 +79,46 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
  */
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
 static const PQcommMethods *OldPqCommMethods;
+
+static void
+free_comp_ctx(compression_ctx *ctx)
+{
+	if (ctx->stream)
+		LZ4_freeStream(ctx->stream);
+	if (ctx->lz4_dict)
+		free(ctx->lz4_dict);
+	destroyPQExpBuffer(ctx->buf);
+	free(ctx);
+}
+
+static compression_ctx *
+init_comp_ctx(void)
+{
+	compression_ctx *ctx = malloc(sizeof(compression_ctx));
+	if (ctx != NULL)
+	{
+		memset(ctx, 0, sizeof(compression_ctx));
+
+		ctx->buf = createPQExpBuffer();
+		if (ctx->buf == NULL)
+			goto cleanup;
+
+		ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
+		if (ctx->lz4_dict == NULL)
+			goto cleanup;
+
+		ctx->stream = LZ4_createStream();
+		if (ctx->stream == NULL)
+			goto cleanup;
+
+		return ctx;
+	}
+
+cleanup:
+	free_comp_ctx(ctx);
+
+	return NULL;;
+}
 
 static void
 socket_comm_reset(void)
@@ -96,62 +153,67 @@ socket_putmessage(char msgtype, const char *s, size_t len)
 static void
 socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 {
-	static PQExpBufferData output_buf = {0,};
-
 	pg_atomic_fetch_add_u64(&stats->total, len);
 
-	if (pg_streampack_client_requested &&
-		pg_streampack_enabled && msgtype == 'd' &&
+	if (comp_ctx != NULL && pg_streampack_enabled &&
+		pg_streampack_client_requested && msgtype == 'd' &&
 		len >= header_size + min_compress_size && s[0] == 'w')
 	{
+		uint64 net_ts;
 		int32 compressed_len;
-		uint32 net_payload_len;
+		uint32 dict_size, net_payload_len;
 		uint32 payload_len = len - header_size;
 		uint32 max_size = LZ4_compressBound(payload_len);
+		compression_ctx *ctx = comp_ctx;
+		PQExpBufferData *buf = ctx->buf;
 
-		if (unlikely(output_buf.data == NULL))
-			initPQExpBuffer(&output_buf);
-		else
-			resetPQExpBuffer(&output_buf);
-		enlargePQExpBuffer(&output_buf, max_size + new_header_size);
-		if (PQExpBufferDataBroken(output_buf))
+		resetPQExpBuffer(buf);
+		enlargePQExpBuffer(buf, new_header_size + max_size);
+		if (PQExpBufferDataBroken(*buf))
 			goto send_uncompressed;
 
 		/* We replace 'w' with 'z' to indicate compression. */
-		appendPQExpBufferChar(&output_buf, 'z');
+		appendPQExpBufferChar(buf, 'z');
 		/* copy other headers (3 * uint64) */
-		appendBinaryPQExpBuffer(&output_buf, &s[1], header_size - 1);
+		appendBinaryPQExpBuffer(buf, &s[1], header_size - 1);
+
 		/*
 		 * Save size of original payload. 4 bytes maybe too much for 128kB max,
 		 * but in a future we can use two highest bits to store compression
 		 * algorithm.
 		 */
 		net_payload_len = pg_hton32(payload_len);
-		appendBinaryPQExpBuffer(&output_buf, (char *)&net_payload_len, sizeof(uint32));
+		appendBinaryPQExpBuffer(buf, (void *)&net_payload_len, sizeof(uint32));
 
 		compressed_len =
-			LZ4_compress_default(&s[header_size],
-								 &output_buf.data[output_buf.len],
-								 payload_len, max_size);
-
+			LZ4_compress_fast_continue(ctx->stream, &s[header_size],
+									   &buf->data[buf->len],
+									   payload_len, max_size, 1); /* default acceleration */
 		if (compressed_len <= 0)
-			goto send_uncompressed;
-
-		if ((output_buf.len += compressed_len) < len)
 		{
-			/* Update timestamp, Since we "wasted" some time on compression. */
-			uint64 net_ts = pg_hton64(GetCurrentTimestamp());
-			memcpy(&output_buf.data[1 + 2 * sizeof(uint64)],
-				   &net_ts, sizeof(uint64));
-
-			/* call original function, which will actually send the message */
-			OldPqCommMethods->putmessage_noblock(msgtype, output_buf.data, output_buf.len);
-			pg_atomic_fetch_add_u64(&stats->compressed, output_buf.len);
-			return;
+			/* If streaming compression failed switch it off. */
+			free_comp_ctx(comp_ctx);
+			comp_ctx = NULL;
+			elog(LOG_SERVER_ONLY, "LZ4 compression failed: %d", compressed_len);
+			goto send_uncompressed;
 		}
-		else
+
+		dict_size = Min(payload_len, LZ4_DICT_SIZE);
+		memcpy(ctx->lz4_dict, &s[len - dict_size],dict_size);
+		LZ4_loadDict(ctx->stream, ctx->lz4_dict, dict_size);
+
+		if ((buf->len += compressed_len) > len)
 			/* final message size is not getting smaller after compression */
 			pg_atomic_fetch_add_u64(&stats->increased, 1);
+
+		/* Update timestamp, Since we "wasted" some time on compression. */
+		net_ts = pg_hton64(GetCurrentTimestamp());
+		memcpy(&buf->data[1 + 2 * sizeof(uint64)], &net_ts, sizeof(uint64));
+
+		/* call original function, which will actually send the message */
+		OldPqCommMethods->putmessage_noblock(msgtype, buf->data, buf->len);
+		pg_atomic_fetch_add_u64(&stats->compressed, buf->len);
+		return;
 	}
 
 send_uncompressed:
@@ -200,7 +262,7 @@ attach_to_walsender(Port *port, int status)
 	if (original_client_auth_hook)
 		original_client_auth_hook(port, status);
 
-	if (am_walsender)
+	if (am_walsender && (comp_ctx = init_comp_ctx()) != NULL)
 	{
 		OldPqCommMethods = PqCommMethods;
 		PqCommMethods = &PqCommSocketMethods;
@@ -215,6 +277,7 @@ static walrcv_startstreaming_fn old_walrcv_startstreaming;
 static walrcv_endstreaming_fn old_walrcv_endstreaming;
 static walrcv_connect_fn old_walrcv_connect;
 static walrcv_receive_fn old_walrcv_receive;
+static walrcv_disconnect_fn old_walrcv_disconnect;
 
 /*
  * Private struct copied from libpqwalreceiver.c
@@ -228,9 +291,51 @@ struct WalReceiverConn
 	bool		logical;
 	/* Buffer for currently read records */
 	char	   *recvBuf;
+	/* Decompression context */
+	decompression_ctx *decomp_ctx;
 	/* Whether this connection is currently in streaming mode */
 	bool		streaming;
 };
+
+static void
+free_decomp_ctx(decompression_ctx *ctx)
+{
+	if (ctx->stream)
+		LZ4_freeStreamDecode(ctx->stream);
+	if (ctx->lz4_dict)
+		free(ctx->lz4_dict);
+	destroyPQExpBuffer(ctx->buf);
+	free(ctx);
+}
+
+static decompression_ctx *
+init_decomp_ctx(void)
+{
+	decompression_ctx *ctx = malloc(sizeof(decompression_ctx));
+	if (ctx != NULL)
+	{
+		memset(ctx, 0, sizeof(compression_ctx));
+
+		ctx->buf = createPQExpBuffer();
+		if (ctx->buf == NULL)
+			goto cleanup;
+
+		ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
+		if (ctx->lz4_dict == NULL)
+			goto cleanup;
+
+		ctx->stream = LZ4_createStreamDecode();
+		if (ctx->stream == NULL)
+			goto cleanup;
+
+		return ctx;
+	}
+
+cleanup:
+	free_decomp_ctx(ctx);
+
+	return NULL;
+}
 
 /*
  * Combination of libpqrcv_connect() and libpqrcv_check_conninfo() from
@@ -265,6 +370,7 @@ libpqrcv_connect(const char *conninfo,
 	bool		must_use_password = false;
 #endif
 	bool		uses_password = false;
+	decompression_ctx *ctx = init_decomp_ctx();
 
 	/*
 	 * We use the expand_dbname parameter to process the connection string (or
@@ -331,7 +437,8 @@ libpqrcv_connect(const char *conninfo,
 			 * match what pg_dump does.
 			 */
 			keys[++i] = "options";
-			vals[i] = pg_streampack_enabled ? LOGICAL_OPTIONS " " COMPRESSION_OPTION : LOGICAL_OPTIONS;
+			vals[i] = pg_streampack_enabled && ctx != NULL ?
+				LOGICAL_OPTIONS " " COMPRESSION_OPTION : LOGICAL_OPTIONS;
 		}
 		else
 		{
@@ -341,9 +448,10 @@ libpqrcv_connect(const char *conninfo,
 			 */
 			keys[++i] = "dbname";
 			vals[i] = "replication";
-			if (pg_streampack_enabled)
+			if (pg_streampack_enabled && ctx != NULL)
 			{
-				options = palloc0(strlen(COMPRESSION_OPTION) + (conn_options ? strlen(conn_options) + 1 : 0) + 1);
+				options = palloc0(1 + strlen(COMPRESSION_OPTION) +
+								  (conn_options ? strlen(conn_options) + 1 : 0));
 				if (conn_options)
 				{
 					strcpy(options, conn_options);
@@ -413,6 +521,7 @@ libpqrcv_connect(const char *conninfo,
 	}
 
 	conn->logical = logical;
+	conn->decomp_ctx = ctx;
 
 	return conn;
 
@@ -424,6 +533,8 @@ bad_connection_errmsg:
 bad_connection:
 	libpqsrv_disconnect(conn->streamConn);
 	pfree(conn);
+	if (ctx != NULL)
+		free_decomp_ctx(ctx);
 	return NULL;
 }
 
@@ -431,13 +542,19 @@ static bool
 libpqrcv_startstreaming(WalReceiverConn *conn,
 						const WalRcvStreamOptions *options)
 {
-	return conn->streaming = old_walrcv_startstreaming(conn, options);
+	if (!old_walrcv_startstreaming(conn, options))
+		return false;
+
+	conn->streaming = conn->decomp_ctx != NULL;
+
+	return true;
 }
 
 static void
 libpqrcv_endstreaming(WalReceiverConn *conn, TimeLineID *next_tli)
 {
 	conn->streaming = false;
+
 	old_walrcv_endstreaming(conn, next_tli);
 }
 
@@ -445,7 +562,6 @@ static int
 libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 				 pgsocket *wait_fd)
 {
-	static StringInfoData input_buf = {0,};
 	int len = old_walrcv_receive(conn, buffer, wait_fd);
 
 	if (!conn->streaming)
@@ -454,42 +570,59 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 	/* 'z' indicates that we received compressed message */
 	if (*buffer && len >= new_header_size && *buffer[0] == 'z')
 	{
-		uint32 uncompressed_len;
+		uint32 dict_size, decompressed_len, expected_len;
 		uint32 payload_len = len - new_header_size;
-		char *buf = *buffer;
-		MemoryContext old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+		decompression_ctx *ctx = conn->decomp_ctx;
+		PQExpBufferData *buf = ctx->buf;
 
 		/* get uncompressed size of payload from headers */
-		memcpy(&uncompressed_len, &buf[header_size], sizeof(uint32));
+		memcpy(&expected_len, &buffer[0][header_size], sizeof(uint32));
 		/* reserve two high bits for compression algorithm */
-		uncompressed_len = pg_ntoh32(uncompressed_len) & 0x3FFFFFFF;
+		expected_len = pg_ntoh32(expected_len) & 0x3FFFFFFF;
 
 		/* Calculate length of uncompressed message. */
-		len = uncompressed_len + header_size;
+		len = header_size + expected_len;
 
-		if (unlikely(input_buf.data == NULL))
-			initStringInfo(&input_buf);
-		else
-			resetStringInfo(&input_buf);
-		enlargeStringInfo(&input_buf, len);
+		resetPQExpBuffer(buf);
+		enlargePQExpBuffer(buf, len);
+		if (PQExpBufferDataBroken(*buf))
+			ereport(ERROR, (errmsg("Failed to allocate %u bytes", len)));
 
-		MemoryContextSwitchTo(old_ctx);
-
-		/* copy headers */
-		pq_sendbyte(&input_buf, 'w');
-		memcpy(&input_buf.data[1], &buf[1], header_size - 1);
+		/* Restore 'w', it was replaced with 'z'. */
+		appendPQExpBufferChar(buf, 'w');
+		/* copy other headers (3 * uint64) */
+		appendBinaryPQExpBuffer(buf, &buffer[0][1], header_size - 1);
 
 		/* uncompress payload */
-		if (LZ4_decompress_safe(&buf[new_header_size],
-								&input_buf.data[header_size],
-								payload_len, uncompressed_len) != uncompressed_len)
-			ereport(ERROR, (errmsg("failed to decompress replication message")));
+		decompressed_len =
+			LZ4_decompress_safe_continue(ctx->stream,
+										 &buffer[0][new_header_size],
+										 &buf->data[header_size],
+										 payload_len, expected_len);
+		if (decompressed_len != expected_len)
+			ereport(ERROR,
+					(errmsg("Failed to decompress replication message: payload_len = %u, expected_len: %u, got: %d\n",
+							payload_len, expected_len, decompressed_len)));
 
-		*buffer = input_buf.data;
+		dict_size = Min(decompressed_len, LZ4_DICT_SIZE);
+		memcpy(ctx->lz4_dict, &buf->data[len - dict_size], dict_size);
+		LZ4_setStreamDecode(ctx->stream, ctx->lz4_dict, dict_size);
+
+		*buffer = buf->data;
 	}
 
 	return len;
 }
+
+static void
+libpqrcv_disconnect(WalReceiverConn *conn)
+{
+	if (conn->decomp_ctx)
+		free_decomp_ctx(conn->decomp_ctx);
+
+	old_walrcv_disconnect(conn);
+}
+
 
 /* allow setting pg_streampack.requested only from client connection */
 static bool
@@ -593,6 +726,9 @@ _PG_init(void)
 
 	old_walrcv_receive = WalReceiverFunctions->walrcv_receive;
 	WalReceiverFunctions->walrcv_receive = libpqrcv_receive;
+
+	old_walrcv_disconnect = WalReceiverFunctions->walrcv_disconnect;
+	WalReceiverFunctions->walrcv_disconnect = libpqrcv_disconnect;
 
 	DefineCustomBoolVariable("pg_streampack.enabled",
 							 "Enable compression of replication messages.",
