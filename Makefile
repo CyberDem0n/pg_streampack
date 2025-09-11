@@ -12,6 +12,7 @@ ifeq ($(enable_coverage),yes)
 	SHLIB_LINK += -lgcov --coverage
 endif
 EXTRA_CLEAN += *.gcno *.gcda
+TAP_TESTS = 1
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

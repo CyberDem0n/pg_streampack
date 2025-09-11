@@ -80,6 +80,8 @@ static const PQcommMethods *OldPqCommMethods;
 static void
 free_comp_ctx(compression_ctx *ctx)
 {
+	if (ctx == NULL)
+		return;
 	if (ctx->stream)
 		LZ4_freeStream(ctx->stream);
 	if (ctx->lz4_dict)
@@ -92,24 +94,24 @@ static compression_ctx *
 init_comp_ctx(void)
 {
 	compression_ctx *ctx = malloc(sizeof(compression_ctx));
-	if (ctx != NULL)
-	{
-		memset(ctx, 0, sizeof(compression_ctx));
+	if (ctx == NULL)
+		goto cleanup;
 
-		ctx->buf = createPQExpBuffer();
-		if (ctx->buf == NULL)
-			goto cleanup;
+	memset(ctx, 0, sizeof(compression_ctx));
 
-		ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
-		if (ctx->lz4_dict == NULL)
-			goto cleanup;
+	ctx->buf = createPQExpBuffer();
+	if (ctx->buf == NULL)
+		goto cleanup;
 
-		ctx->stream = LZ4_createStream();
-		if (ctx->stream == NULL)
-			goto cleanup;
+	ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
+	if (ctx->lz4_dict == NULL)
+		goto cleanup;
 
-		return ctx;
-	}
+	ctx->stream = LZ4_createStream();
+	if (ctx->stream == NULL)
+		goto cleanup;
+
+	return ctx;
 
 cleanup:
 	free_comp_ctx(ctx);
@@ -251,6 +253,12 @@ PQcommMethods PqCommSocketMethods = {
 };
 
 static void
+on_exit_callback(int code, Datum arg)
+{
+	free_comp_ctx(comp_ctx);
+}
+
+static void
 attach_to_walsender(Port *port, int status)
 {
 	/*
@@ -262,6 +270,7 @@ attach_to_walsender(Port *port, int status)
 	if (am_walsender && pg_streampack_enabled &&
 		(comp_ctx = init_comp_ctx()) != NULL)
 	{
+		on_proc_exit(on_exit_callback, 0);
 		OldPqCommMethods = PqCommMethods;
 		PqCommMethods = &PqCommSocketMethods;
 	}
@@ -312,24 +321,24 @@ static decompression_ctx *
 init_decomp_ctx(void)
 {
 	decompression_ctx *ctx = malloc(sizeof(decompression_ctx));
-	if (ctx != NULL)
-	{
-		memset(ctx, 0, sizeof(compression_ctx));
+	if (ctx == NULL)
+		goto cleanup;
 
-		ctx->buf = createPQExpBuffer();
-		if (ctx->buf == NULL)
-			goto cleanup;
+	memset(ctx, 0, sizeof(compression_ctx));
 
-		ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
-		if (ctx->lz4_dict == NULL)
-			goto cleanup;
+	ctx->buf = createPQExpBuffer();
+	if (ctx->buf == NULL)
+		goto cleanup;
 
-		ctx->stream = LZ4_createStreamDecode();
-		if (ctx->stream == NULL)
-			goto cleanup;
+	ctx->lz4_dict = malloc(LZ4_DICT_SIZE);
+	if (ctx->lz4_dict == NULL)
+		goto cleanup;
 
-		return ctx;
-	}
+	ctx->stream = LZ4_createStreamDecode();
+	if (ctx->stream == NULL)
+		goto cleanup;
+
+	return ctx;
 
 cleanup:
 	free_decomp_ctx(ctx);
@@ -569,7 +578,8 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 	/* 'z' indicates that we received compressed message */
 	if (*buffer && len >= new_header_size && *buffer[0] == 'z')
 	{
-		uint32 dict_size, decompressed_len, expected_len;
+		int decompressed_len;
+		uint32 dict_size, expected_len;
 		uint32 payload_len = len - new_header_size;
 		decompression_ctx *ctx = conn->decomp_ctx;
 		PQExpBufferData *buf = ctx->buf;
