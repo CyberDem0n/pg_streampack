@@ -13,7 +13,11 @@
 #include "storage/shmem.h"
 #include "utils/guc.h"
 
+#if PG_VERSION_NUM >= 180000
+PG_MODULE_MAGIC_EXT(.name = "pg_streampack", .version = "0.1");
+#else
 PG_MODULE_MAGIC;
+#endif
 
 PGDLLEXPORT void _PG_init(void);
 
