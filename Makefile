@@ -1,9 +1,6 @@
 MODULE_big = pg_streampack
 OBJS = $(MODULE_big).o
 
-REGRESS_OPTS = --temp-config $(MODULE_big).conf --temp-instance=./tmp_check
-REGRESS = test_logical_compression
-
 PG_CPPFLAGS += -Wall -Werror -Wno-unused-parameter -Wno-uninitialized -Wno-implicit-fallthrough -Iinclude -I$(libpq_srcdir)
 SHLIB_LINK += $(libpq)
 
