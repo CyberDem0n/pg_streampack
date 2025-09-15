@@ -202,7 +202,7 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		}
 
 		dict_size = Min(payload_len, LZ4_DICT_SIZE);
-		memcpy(ctx->lz4_dict, &s[len - dict_size],dict_size);
+		memcpy(ctx->lz4_dict, &s[len - dict_size], dict_size);
 		LZ4_loadDict(ctx->stream, ctx->lz4_dict, dict_size);
 
 		if ((buf->len += compressed_len) > len)
@@ -554,12 +554,12 @@ static bool
 libpqrcv_startstreaming(WalReceiverConn *conn,
 						const WalRcvStreamOptions *options)
 {
-	if (!old_walrcv_startstreaming(conn, options))
-		return false;
+	bool ret = old_walrcv_startstreaming(conn, options);
 
-	conn->streaming = conn->decomp_ctx != NULL;
+	if (ret)
+		conn->streaming = conn->decomp_ctx != NULL;
 
-	return true;
+	return ret;
 }
 
 static void
@@ -576,11 +576,8 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 {
 	int len = old_walrcv_receive(conn, buffer, wait_fd);
 
-	if (!conn->streaming)
-		return len;
-
 	/* 'z' indicates that we received compressed message */
-	if (*buffer && len >= new_header_size && *buffer[0] == 'z')
+	if (conn->streaming && len >= new_header_size && *buffer[0] == 'z')
 	{
 		int decompressed_len;
 		uint32 dict_size, expected_len;
@@ -610,7 +607,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		decompressed_len =
 			LZ4_decompress_safe_continue(ctx->stream,
 										 &buffer[0][new_header_size],
-										 &buf->data[header_size],
+										 &buf->data[buf->len],
 										 payload_len, expected_len);
 		if (decompressed_len != expected_len)
 			ereport(ERROR,

@@ -33,7 +33,7 @@ sub check_log
 
 my $config = qq(
 wal_level = logical
-shared_preload_libraries = pg_streampack
+shared_preload_libraries = 'pg_stat_statements,pg_streampack'
 pg_streampack.enabled = on
 pg_streampack.min_size = 1
 );
