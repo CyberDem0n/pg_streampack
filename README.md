@@ -30,8 +30,8 @@ Example setting in postgresql.conf:
     shared_preload_libraries = 'pg_streampack'
     pg_streampack.enabled = on
 
-    # compresses replication messages starting from 128 bytes
-    pg_streampack.min_size = 128
+    # compresses replication messages starting from 32 bytes
+    pg_streampack.min_size = 32
 
 Restart the servers after changing the configuration.
 
@@ -48,11 +48,3 @@ Limitations and Known Problems
 - Module must be installed and added to `shared_preload_libraries` on both,
   primary and standby
 - Slight increase in CPU usage due to compression/decompression
-- When used together with `pg_failover_slots`, the order in
-  `shared_preload_libraries` matters:
-
-      shared_preload_libraries = 'pg_streampack,pg_failover_slots'
-
-  If `pg_failover_slots` is listed before `pg_streampack`, then logical
-  replication slots may start sending changes before physical standbys have
-  received the WAL, which can break failover safety guarantees.

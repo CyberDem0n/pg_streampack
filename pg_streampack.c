@@ -25,7 +25,8 @@ PGDLLEXPORT void _PG_init(void);
 #define LOGICAL_OPTIONS "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3"
 #define COMPRESSION_OPTION "-c pg_streampack.requested=on"
 
-static const uint32 header_size = 1 + 3 * sizeof(uint64);
+static const uint32 ts_offset = 1 + 2 * sizeof(uint64);
+static const uint32 header_size = ts_offset * sizeof(uint64);
 static const uint32 new_header_size = header_size + sizeof(uint32);
 
 /*
@@ -101,7 +102,7 @@ init_comp_ctx(void)
 	if (ctx == NULL)
 		goto cleanup;
 
-	memset(ctx, 0, sizeof(compression_ctx));
+	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->buf = createPQExpBuffer();
 	if (ctx->buf == NULL)
@@ -120,7 +121,7 @@ init_comp_ctx(void)
 cleanup:
 	free_comp_ctx(ctx);
 
-	return NULL;;
+	return NULL;
 }
 
 static void
@@ -175,10 +176,8 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		if (PQExpBufferDataBroken(*buf))
 			goto send_uncompressed;
 
-		/* We replace 'w' with 'z' to indicate compression. */
-		appendPQExpBufferChar(buf, 'z');
-		/* copy other headers (3 * uint64) */
-		appendBinaryPQExpBuffer(buf, &s[1], header_size - 1);
+		/* copy headers */
+		appendBinaryPQExpBuffer(buf, s, header_size);
 
 		/*
 		 * Save size of original payload. 4 bytes maybe too much for 128kB max,
@@ -209,9 +208,12 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 			/* final message size is not getting smaller after compression */
 			pg_atomic_fetch_add_u64(&stats->increased, 1);
 
-		/* Update timestamp, Since we "wasted" some time on compression. */
-		net_ts = pg_hton64(GetCurrentTimestamp());
-		memcpy(&buf->data[1 + 2 * sizeof(uint64)], &net_ts, sizeof(uint64));
+		/*
+		 * Update timestamp, since we "wasted" some time on compression.
+		 * Set the most significant bit as an indicator that message is compressed.
+		 */
+		net_ts = pg_hton64(GetCurrentTimestamp() | 0x8000000000000000LL);
+		memcpy(&buf->data[ts_offset], &net_ts, sizeof(uint64));
 
 		/* call original function, which will actually send the message */
 		OldPqCommMethods->putmessage_noblock(msgtype, buf->data, buf->len);
@@ -328,7 +330,7 @@ init_decomp_ctx(void)
 	if (ctx == NULL)
 		goto cleanup;
 
-	memset(ctx, 0, sizeof(compression_ctx));
+	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->buf = createPQExpBuffer();
 	if (ctx->buf == NULL)
@@ -576,8 +578,9 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 {
 	int len = old_walrcv_receive(conn, buffer, wait_fd);
 
-	/* 'z' indicates that we received compressed message */
-	if (conn->streaming && len >= new_header_size && *buffer[0] == 'z')
+	/* Most significant bit in timestamp indicates compression. */
+	if (conn->streaming && len >= new_header_size &&
+		buffer[0][0] == 'w' && buffer[0][ts_offset] & 0x80)
 	{
 		int decompressed_len;
 		uint32 dict_size, expected_len;
@@ -598,10 +601,10 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		if (PQExpBufferDataBroken(*buf))
 			ereport(ERROR, (errmsg("Failed to allocate %u bytes", len)));
 
-		/* Restore 'w', it was replaced with 'z'. */
-		appendPQExpBufferChar(buf, 'w');
-		/* copy other headers (3 * uint64) */
-		appendBinaryPQExpBuffer(buf, &buffer[0][1], header_size - 1);
+		/* Reset bit indicating compression */
+		buffer[0][ts_offset] &= 0x7F;
+		/* copy original header */
+		appendBinaryPQExpBuffer(buf, *buffer, header_size);
 
 		/* uncompress payload */
 		decompressed_len =
@@ -669,7 +672,7 @@ shmem_startup(void)
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
-	stats = ShmemInitStruct("pg_streampack", sizeof(*stats), &found);
+	stats = ShmemInitStruct("pg_streampack", memsize(), &found);
 	if (!found)
 	{
 		pg_atomic_init_u64(&stats->uncompressed, 0);
@@ -764,7 +767,7 @@ _PG_init(void)
 							"Minimal size of payload to compress.",
 							"",
 							&min_compress_size,
-							128,
+							32,
 							1,
 							INT_MAX,
 							PGC_SIGHUP,
