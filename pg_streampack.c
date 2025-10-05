@@ -25,9 +25,24 @@ PGDLLEXPORT void _PG_init(void);
 #define LOGICAL_OPTIONS "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3"
 #define COMPRESSION_OPTION "-c pg_streampack.requested=on"
 
-static const uint32 ts_offset = 1 + 2 * sizeof(uint64);
-static const uint32 header_size = ts_offset * sizeof(uint64);
-static const uint32 new_header_size = header_size + sizeof(uint32);
+/*
+ * Offsets/sizes for replication XLogData message:
+ *   1 byte message type ('w')
+ *   8 bytes walStart (network byte order)
+ *   8 bytes walEnd (network byte order)
+ *   8 bytes sendTime (network byte order)
+ *
+ * We steal the most significant bit of the first byte of the network-order
+ * sendTime field to indicate that the message payload is LZ4-compressed and
+ * that we have appended a 4-byte uncompressed length immediately after the
+ * normal 25-byte header. The receiver clears that bit before exposing the
+ * header upward.
+ */
+static const uint32 ts_offset = 1 + 2 * sizeof(uint64);				/* byte offset of sendTime field */
+static const uint32 header_size = ts_offset + sizeof(uint64);		/* 25 bytes total */
+static const uint32 new_header_size = header_size + sizeof(uint32);	/* +4 bytes (uncompressed length) for compressed msg */
+
+#define PG_STREAMPACK_FLAG_MASK 0x80
 
 /*
  * This server is configured to use compression.
@@ -176,7 +191,7 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		if (PQExpBufferDataBroken(*buf))
 			goto send_uncompressed;
 
-		/* copy headers */
+		/* Copy original replication header (msgtype + 3 * uint64)  */
 		appendBinaryPQExpBuffer(buf, s, header_size);
 
 		/*
@@ -187,6 +202,12 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		net_payload_len = pg_hton32(payload_len);
 		appendBinaryPQExpBuffer(buf, (void *)&net_payload_len, sizeof(uint32));
 
+		/*
+		 * Streaming compression.
+		 * NOTE: We DO NOT fallback to uncompressed if expansion occurs,
+		 * because that would desynchronize sender/receiver dictionaries.
+		 * Instead we count 'increased' and keep going.
+		 */
 		compressed_len =
 			LZ4_compress_fast_continue(ctx->stream, &s[header_size],
 									   &buf->data[buf->len],
@@ -212,7 +233,7 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		 * Update timestamp, since we "wasted" some time on compression.
 		 * Set the most significant bit as an indicator that message is compressed.
 		 */
-		net_ts = pg_hton64(GetCurrentTimestamp() | 0x8000000000000000LL);
+		net_ts = pg_hton64(GetCurrentTimestamp() | (((uint64) PG_STREAMPACK_FLAG_MASK) << 56));
 		memcpy(&buf->data[ts_offset], &net_ts, sizeof(uint64));
 
 		/* call original function, which will actually send the message */
@@ -579,8 +600,8 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 	int len = old_walrcv_receive(conn, buffer, wait_fd);
 
 	/* Most significant bit in timestamp indicates compression. */
-	if (conn->streaming && len >= new_header_size &&
-		buffer[0][0] == 'w' && buffer[0][ts_offset] & 0x80)
+	if (conn->streaming && len >= new_header_size && buffer[0][0] == 'w' &&
+		(uint8) (buffer[0][ts_offset] & PG_STREAMPACK_FLAG_MASK))
 	{
 		int decompressed_len;
 		uint32 dict_size, expected_len;
@@ -588,7 +609,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		decompression_ctx *ctx = conn->decomp_ctx;
 		PQExpBufferData *buf = ctx->buf;
 
-		/* get uncompressed size of payload from headers */
+		/* get uncompressed size of payload from appended 4-byte field */
 		memcpy(&expected_len, &buffer[0][header_size], sizeof(uint32));
 		/* reserve two high bits for compression algorithm */
 		expected_len = pg_ntoh32(expected_len) & 0x3FFFFFFF;
@@ -601,10 +622,10 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		if (PQExpBufferDataBroken(*buf))
 			ereport(ERROR, (errmsg("Failed to allocate %u bytes", len)));
 
-		/* Reset bit indicating compression */
-		buffer[0][ts_offset] &= 0x7F;
 		/* copy original header */
 		appendBinaryPQExpBuffer(buf, *buffer, header_size);
+		/* Reset bit indicating compression */
+		((uint8 *) buf->data)[ts_offset] &= (uint8) ~PG_STREAMPACK_FLAG_MASK;
 
 		/* uncompress payload */
 		decompressed_len =
@@ -617,8 +638,9 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 					(errmsg("Failed to decompress replication message: payload_len = %u, expected_len: %u, got: %d\n",
 							payload_len, expected_len, decompressed_len)));
 
+		buf->len += decompressed_len;
 		dict_size = Min(decompressed_len, LZ4_DICT_SIZE);
-		memcpy(ctx->lz4_dict, &buf->data[len - dict_size], dict_size);
+		memcpy(ctx->lz4_dict, &buf->data[buf->len - dict_size], dict_size);
 		LZ4_setStreamDecode(ctx->stream, ctx->lz4_dict, dict_size);
 
 		*buffer = buf->data;
@@ -653,11 +675,11 @@ static void
 shmem_shutdown(int code, Datum arg)
 {
 	elog(LOG,
-		 "pg_streampack state: total: %lu bytes, uncompressed: %lu bytes, compressed: %lu bytes, compression increased size: %lu times",
-		 pg_atomic_read_u64(&stats->total),
-		 pg_atomic_read_u64(&stats->uncompressed),
-		 pg_atomic_read_u64(&stats->compressed),
-		 pg_atomic_read_u64(&stats->increased));
+		 "pg_streampack state: total: " UINT64_FORMAT " bytes, uncompressed: " UINT64_FORMAT " bytes, compressed: " UINT64_FORMAT " bytes, compression increased size: " UINT64_FORMAT " times",
+		 (uint64) pg_atomic_read_u64(&stats->total),
+		 (uint64) pg_atomic_read_u64(&stats->uncompressed),
+		 (uint64) pg_atomic_read_u64(&stats->compressed),
+		 (uint64) pg_atomic_read_u64(&stats->increased));
 }
 
 static void
