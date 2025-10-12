@@ -1,4 +1,5 @@
 #include <lz4.h>
+#include <zstd.h>
 
 #include "postgres.h"
 
@@ -60,7 +61,7 @@ typedef struct
 {
 	PQExpBufferData *buf;
 	char *lz4_dict;
-	LZ4_stream_t *stream;
+	LZ4_stream_t *lz4_stream;
 } compression_ctx;
 
 static compression_ctx *comp_ctx = NULL;
@@ -69,7 +70,7 @@ typedef struct
 {
 	PQExpBufferData *buf;
 	char *lz4_dict;
-	LZ4_streamDecode_t *stream;
+	LZ4_streamDecode_t *lz4_stream;
 } decompression_ctx;
 
 /*
@@ -102,8 +103,8 @@ free_comp_ctx(compression_ctx *ctx)
 {
 	if (ctx == NULL)
 		return;
-	if (ctx->stream)
-		LZ4_freeStream(ctx->stream);
+	if (ctx->lz4_stream)
+		LZ4_freeStream(ctx->lz4_stream);
 	if (ctx->lz4_dict)
 		free(ctx->lz4_dict);
 	destroyPQExpBuffer(ctx->buf);
@@ -127,8 +128,8 @@ init_comp_ctx(void)
 	if (ctx->lz4_dict == NULL)
 		goto cleanup;
 
-	ctx->stream = LZ4_createStream();
-	if (ctx->stream == NULL)
+	ctx->lz4_stream = LZ4_createStream();
+	if (ctx->lz4_stream == NULL)
 		goto cleanup;
 
 	return ctx;
@@ -209,7 +210,7 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		 * Instead we count 'increased' and keep going.
 		 */
 		compressed_len =
-			LZ4_compress_fast_continue(ctx->stream, &s[header_size],
+			LZ4_compress_fast_continue(ctx->lz4_stream, &s[header_size],
 									   &buf->data[buf->len],
 									   payload_len, max_size, 1); /* default acceleration */
 		if (compressed_len <= 0)
@@ -223,7 +224,7 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 
 		dict_size = Min(payload_len, LZ4_DICT_SIZE);
 		memcpy(ctx->lz4_dict, &s[len - dict_size], dict_size);
-		LZ4_loadDict(ctx->stream, ctx->lz4_dict, dict_size);
+		LZ4_loadDict(ctx->lz4_stream, ctx->lz4_dict, dict_size);
 
 		if ((buf->len += compressed_len) > len)
 			/* final message size is not getting smaller after compression */
@@ -336,8 +337,8 @@ free_decomp_ctx(decompression_ctx *ctx)
 {
 	if (ctx == NULL)
 		return;
-	if (ctx->stream)
-		LZ4_freeStreamDecode(ctx->stream);
+	if (ctx->lz4_stream)
+		LZ4_freeStreamDecode(ctx->lz4_stream);
 	if (ctx->lz4_dict)
 		free(ctx->lz4_dict);
 	destroyPQExpBuffer(ctx->buf);
@@ -361,8 +362,8 @@ init_decomp_ctx(void)
 	if (ctx->lz4_dict == NULL)
 		goto cleanup;
 
-	ctx->stream = LZ4_createStreamDecode();
-	if (ctx->stream == NULL)
+	ctx->lz4_stream = LZ4_createStreamDecode();
+	if (ctx->lz4_stream == NULL)
 		goto cleanup;
 
 	return ctx;
@@ -629,7 +630,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 
 		/* uncompress payload */
 		decompressed_len =
-			LZ4_decompress_safe_continue(ctx->stream,
+			LZ4_decompress_safe_continue(ctx->lz4_stream,
 										 &buffer[0][new_header_size],
 										 &buf->data[buf->len],
 										 payload_len, expected_len);
@@ -641,7 +642,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		buf->len += decompressed_len;
 		dict_size = Min(decompressed_len, LZ4_DICT_SIZE);
 		memcpy(ctx->lz4_dict, &buf->data[buf->len - dict_size], dict_size);
-		LZ4_setStreamDecode(ctx->stream, ctx->lz4_dict, dict_size);
+		LZ4_setStreamDecode(ctx->lz4_stream, ctx->lz4_dict, dict_size);
 
 		*buffer = buf->data;
 	}
