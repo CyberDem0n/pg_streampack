@@ -32,8 +32,10 @@ sub check_log
 }
 
 my @compressions = ();
-push @compressions, "zstd" if check_pg_config("#define USE_ZSTD 1");
-push @compressions, "lz4" if check_pg_config("#define USE_LZ4 1");
+eval {scan_server_header('pg_config.h', "#define USE_ZSTD 1")};
+push @compressions, "zstd" if not $@;
+eval {scan_server_header('pg_config.h', "#define USE_LZ4 1")};
+push @compressions, "lz4" if not $@;
 
 my $compression = join(",", @compressions);
 
