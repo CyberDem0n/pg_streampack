@@ -2,15 +2,15 @@ pg_streampack
 =============
 
 `pg_streampack` is a PostgreSQL module that compresses replication streams
-using lz4 before sending them over the network.
+using ZSTD or LZ4 before sending them over the network.
 It reduces bandwidth usage between primary and standby servers, which is
 especially useful over slow or costly connections.
 
 Features
 --------
 
-- Transparent lz4 compression for replication streams
-- Uses streaming (dictionary) LZ4 compression to obtain better compression ratios across sequential WAL traffic
+- Transparent compression for replication streams
+- Uses streaming compression to obtain better compression ratios across sequential WAL traffic
 - Minimal configuration changes for existing replication setups
 - Works with streaming replication (physical and logical)
 - Unmodified clients that do **not** request compression continue to operate normally
@@ -30,7 +30,7 @@ Example setting in postgresql.conf:
 
     # Enable replication stream compression
     shared_preload_libraries = 'pg_streampack'
-    pg_streampack.enabled = on
+    pg_streampack.compression = 'zstd,lz4'
 
     # compresses replication messages starting from 32 bytes
     pg_streampack.min_size = 32
@@ -42,14 +42,19 @@ Note. Module must be installed and added to `shared_preload_libraries` on both s
 Compatibility
 -------------
 
-- PostgreSQL 13+, however when building for v13 it needs to be linked with `liblz4`
+- By default supports the same compression algorithms that are supported by PostgreSQL major version:
+	- PostgreSQL 14+ - LZ4 (if PostgreSQL is compiled with `--with-lz4`)
+	- PostgreSQL 15+ - LZ4 and ZSTD (if PostgreSQL is compiled with `--with-lz4` and `--with-zstd`)
+- Compiles with PostgreSQL 13, however by defaul will not do anything useful
+	- It is possible to manually define `USE_LZ4` and `USE_ZSTD` and link with `-llz4` and `-lzstd`. It will enable "unsupported" algorithms on PostgreSQL older than 15.
 - Supports both physical and logical streaming replication
 
 Negotiation
 -----------
 
 `pg_streampack` only compresses replication stream messages when both the server and the client explicitly agree.
-There is no new network handshake or protocol command; instead, negotiation happens by sending `-c pg_streampack.requested=on` via connection `options` if `pg_streampack.enabled` GUC is set.
+There is no new network handshake or protocol command; instead, negotiation happens by sending `-c pg_streampack.requested=$pg_streampack.compression` via connection `options` if `pg_streampack.compression` GUC is set and valid.
+Upstream server prefers the algorithm which is earlier in the list recieved via `pg_streampack.requested` GUC.
 If either side doesn’t “opt in”, replication messages stay exactly as PostgreSQL normally sends them.
 The receiver detects compression by inspecting a flag bit in the `XLogData` header.
 
@@ -70,7 +75,7 @@ Offset  Size  Field
 When compressed by `pg_streampack`, the following modifications occur:
 
 1. The *most significant bit* of the first byte of the network‑order `sendTime` field (i.e., header byte at offset 17) is set to 1.
-2. A 4‑byte big-endian unsigned integer containing the **uncompressed payload length** is inserted immediately after the original 25‑byte header.
+2. A 4‑byte big-endian unsigned integer containing compression algorithm (2 bits) and the **uncompressed payload length** (30 bits) is inserted immediately after the original 25‑byte header.
 3. The WAL payload is replaced by compressed bytes of the original payload.
 
 Resulting compressed layout:
@@ -81,7 +86,7 @@ Offset  Size  Field
 1       8     walStart
 9       8     walEnd
 17      8     sendTime with most significant bit set (compression flag) *
-25      4     uncompressed length (uint32)  (currently lower 30 bits used; top 2 reserved for different compression algorithms)
+25      4     (uint32), 2 bits for compression algorithm, 30 bits for actual uncompressed length
 29      ...   compressed payload
 ```
 

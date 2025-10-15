@@ -31,10 +31,17 @@ sub check_log
 	is($found, 1, $msg);
 }
 
+my @compressions = ();
+push @compressions, "zstd" if check_pg_config("#define USE_ZSTD 1");
+push @compressions, "lz4" if check_pg_config("#define USE_LZ4 1");
+
+my $compression = join(",", @compressions);
+
 my $config = qq(
+autovacuum = off
 wal_level = logical
 shared_preload_libraries = 'pg_stat_statements,pg_streampack'
-pg_streampack.enabled = on
+pg_streampack.compression = '$compression'
 pg_streampack.min_size = 1
 );
 
@@ -56,6 +63,10 @@ $node_standby->init_from_backup($node_primary, $backup_name);
 my $primary_conninfo = $node_primary->connstr . " options=''-c foo.bar=0''";
 $node_standby->append_conf('postgresql.conf', qq(
 primary_conninfo = '$primary_conninfo'
+));
+my $standby_compression = join(",", reverse @compressions);
+$node_standby->append_conf('postgresql.auto.conf', qq(
+pg_streampack.compression = '$standby_compression'
 ));
 $node_standby->set_standby_mode;
 $node_standby->start;
@@ -127,11 +138,37 @@ check_log($node_logical, $log_size,
 	"invalid connection string syntax:",
 	'invalid connection string');
 
+$node_standby->stop;
 $node_logical->stop;
 $log_size = -s $node_primary->logfile;
 $node_primary->stop;
-check_log($node_primary, $log_size,
-	'pg_streampack state: total: [1-9]\d* bytes, uncompressed: \d+ bytes, compressed: [1-9]\d+ bytes, compression increased size: \d+ times',
-	'compression works');
+if (scalar(@compressions) > 1)
+{
+	check_log($node_primary, $log_size,
+		'pg_streampack state: total: [1-9]\d* bytes, uncompressed: \d+ bytes, compressed: [1-9]\d+ bytes, compression increased size: \d+ times',
+		'compression works');
+
+	$node_primary->append_conf('postgresql.auto.conf', qq(
+pg_streampack.compression = '$compressions[0]'
+));
+	$node_primary->start;
+
+	$node_standby->append_conf('postgresql.auto.conf', qq(
+pg_streampack.compression = '$compressions[1]'
+));
+	$node_standby->start;
+
+	$node_primary->safe_psql('postgres',
+		"INSERT INTO test SELECT 10001, repeat('10001', 10001)");
+
+	check_caught_up($node_standby, '399101015');
+
+	$node_standby->stop;
+	$log_size = -s $node_primary->logfile;
+	$node_primary->stop;
+	check_log($node_primary, $log_size,
+		'pg_streampack state: total: [1-9]\d* bytes, uncompressed: \d+ bytes, compressed: 0 bytes, compression increased size: 0 times',
+		'compression did not negotiate');
+}
 
 done_testing();
