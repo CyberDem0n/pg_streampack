@@ -48,7 +48,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 #define LZ4_DICT_SIZE 65536
 #define LOGICAL_OPTIONS "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3"
-#define COMPRESSION_OPTION "-c pg_streampack.requested="
+#define COMPRESSION_REQUEST_OPTION "-c pg_streampack.requested="
 
 /*
  * Offsets/sizes for replication XLogData message:
@@ -71,9 +71,9 @@ static const uint32 new_header_size = header_size + sizeof(uint32);	/* +4 bytes 
 
 typedef enum
 {
-	COMPRESS_ZSTD = 1,
-	COMPRESS_LZ4 = 2,
-	COMPRESS_MAX_ID = 2
+	COMPRESS_ZSTD = 0,
+	COMPRESS_LZ4 = 1,
+	COMPRESS_ALGO_COUNT
 } pg_streampack_algo;
 
 static const struct config_enum_entry algo_options[] = {
@@ -97,9 +97,10 @@ static char *pg_streampack_compression_string = NULL;
  * We use pg_streampack_compression_configured as a hash to quickly check which
  * algorithms are configured in pg_streampack.compression.
  */
-static bool pg_streampack_compression_configured[COMPRESS_MAX_ID + 1] = {0,};
+static bool pg_streampack_compression_configured[COMPRESS_ALGO_COUNT] = {0,};
 /* List of algorithms from pg_streampack.compression GUC after parsing */
-static uint32 pg_streampack_compression_order[COMPRESS_MAX_ID] = {0,};
+static uint32 pg_streampack_compression_order[COMPRESS_ALGO_COUNT] = {0,};
+static uint32 pg_streampack_compression_order_count = 0;
 
 /* replication client "requested" compression by passing GUC */
 static char *pg_streampack_client_requested_string = 0;
@@ -107,19 +108,13 @@ static char *pg_streampack_client_requested_string = 0;
 /* from which size we should try compressing messages. */
 static int min_compress_size;
 
-static bool
-pg_streampack_enabled(void)
-{
-	return pg_streampack_compression_order[0] > 0;
-}
-
 static char *
 pg_streampack_compression_request(void)
 {
 	static char ret[16];
 
 	memset(ret, 0, sizeof(ret));
-	for (int i = 0; i < COMPRESS_MAX_ID && pg_streampack_compression_order[i]; i++)
+	for (int i = 0; i < pg_streampack_compression_order_count; i++)
 	{
 		if (i > 0)
 			strcat(ret, ",");
@@ -278,7 +273,7 @@ socket_putmessage(char msgtype, const char *s, size_t len)
 static void
 append_new_header(uint32 algo, uint32 payload_len)
 {
-	uint32 net_payload_len = pg_hton32(((algo -1) << COMPRESSION_ALGO_SHIFT) | payload_len);
+	uint32 net_payload_len = pg_hton32((algo << COMPRESSION_ALGO_SHIFT) | payload_len);
 	appendBinaryPQExpBuffer(comp_ctx->buf, (void *)&net_payload_len, sizeof(uint32));
 }
 #endif
@@ -447,8 +442,8 @@ attach_to_walsender(Port *port, int status)
 	if (original_client_auth_hook)
 		original_client_auth_hook(port, status);
 
-	if (am_walsender && pg_streampack_enabled() &&
-		(comp_ctx = init_comp_ctx()) != NULL)
+	if (pg_streampack_compression_order_count > 0 &&
+		am_walsender && (comp_ctx = init_comp_ctx()) != NULL)
 	{
 		on_proc_exit(on_exit_callback, 0);
 		OldPqCommMethods = PqCommMethods;
@@ -615,7 +610,7 @@ libpqrcv_connect(const char *conninfo,
 	bool		must_use_password = false;
 #endif
 	bool		uses_password = false;
-	decompression_ctx *ctx = pg_streampack_enabled() ? init_decomp_ctx() : NULL;
+	decompression_ctx *ctx = pg_streampack_compression_order_count > 0 ? init_decomp_ctx() : NULL;
 
 	/*
 	 * We use the expand_dbname parameter to process the connection string (or
@@ -664,8 +659,6 @@ libpqrcv_connect(const char *conninfo,
 
 	if (replication)
 	{
-		char *compression_request = ctx == NULL ? "" : pg_streampack_compression_request();
-
 		keys[++i] = "replication";
 		vals[i] = logical ? "database" : "true";
 
@@ -703,7 +696,9 @@ libpqrcv_connect(const char *conninfo,
 
 		if (ctx != NULL)
 		{
-			options = palloc0(1 + strlen(COMPRESSION_OPTION) +
+			char *compression_request = pg_streampack_compression_request();
+
+			options = palloc0(1 + strlen(COMPRESSION_REQUEST_OPTION) +
 							  strlen(compression_request) +
 							  (conn_options ? strlen(conn_options) + 1 : 0));
 			if (conn_options)
@@ -711,7 +706,7 @@ libpqrcv_connect(const char *conninfo,
 				strcpy(options, conn_options);
 				strcat(options, " ");
 			}
-			strcat(options, COMPRESSION_OPTION);
+			strcat(options, COMPRESSION_REQUEST_OPTION);
 			strcat(options, compression_request);
 
 			keys[++i] = "options";
@@ -867,40 +862,40 @@ maybe_set_decompress(decompression_ctx *ctx, uint32 algo)
 	 * runtime. If there is a mismatch decompression will fail and produce
 	 * meaningful error.
 	 */
-	if (ctx->decompress == NULL)
+	if (ctx->decompress != NULL)
+		return;
+
+	switch (algo)
 	{
-		switch (algo)
-		{
-			case COMPRESS_ZSTD:
+		case COMPRESS_ZSTD:
 #ifdef USE_ZSTD
-				if (ctx->zstd_stream)
-				{
-					free_decomp_ctx_lz4(ctx);
-					ctx->decompress = pg_streampack_decompress_zstd;
-					elog(LOG_SERVER_ONLY, "Receiving ZSTD compressed stream");
-				}
-				else
+			if (ctx->zstd_stream)
+			{
+				free_decomp_ctx_lz4(ctx);
+				ctx->decompress = pg_streampack_decompress_zstd;
+				elog(LOG_SERVER_ONLY, "Receiving ZSTD compressed stream");
+			}
+			else
 #endif
-					ereport(ERROR,
-							(errmsg("Cannot decompress ZSTD replication message")));
-				break;
-			case COMPRESS_LZ4:
-#ifdef USE_LZ4
-				if (ctx->lz4_stream)
-				{
-					free_decomp_ctx_zstd(ctx);
-					ctx->decompress = pg_streampack_decompress_lz4;
-					elog(LOG_SERVER_ONLY, "Receiving LZ4 compressed stream");
-				}
-				else
-#endif
-					ereport(ERROR,
-							(errmsg("Cannot decompress LZ4 replication message")));
-				break;
-			default:
 				ereport(ERROR,
-						(errmsg("Unknown algo %u", algo)));
-		}
+						(errmsg("Cannot decompress ZSTD replication message")));
+			break;
+		case COMPRESS_LZ4:
+#ifdef USE_LZ4
+			if (ctx->lz4_stream)
+			{
+				free_decomp_ctx_zstd(ctx);
+				ctx->decompress = pg_streampack_decompress_lz4;
+				elog(LOG_SERVER_ONLY, "Receiving LZ4 compressed stream");
+			}
+			else
+#endif
+				ereport(ERROR,
+						(errmsg("Cannot decompress LZ4 replication message")));
+			break;
+		default:
+			ereport(ERROR,
+					(errmsg("Unknown algo %u", algo)));
 	}
 }
 
@@ -924,7 +919,7 @@ libpqrcv_receive(WalReceiverConn *conn, char **buffer,
 		expected_len = pg_ntoh32(expected_len);
 
 		/* extract algorithm from two high bits */
-		algo = (expected_len >> COMPRESSION_ALGO_SHIFT) + 1;
+		algo = expected_len >> COMPRESSION_ALGO_SHIFT;
 
 		maybe_set_decompress(ctx, algo);
 
@@ -980,16 +975,15 @@ guc_malloc(int elevel, size_t size)
 static bool
 compression_validate_parameter(const char *name, const char *value, void **extra)
 {
-	ListCell *l;
 	List *elemlist;
 	bool ret = false;
 	char *rawstring = pstrdup(value);
 
 	if (SplitIdentifierString(rawstring, ',', &elemlist))
 	{
-		uint32 seen[COMPRESS_MAX_ID] = {0,};
-		uint32 order[COMPRESS_MAX_ID] = {0,};
-		size_t num = 0;
+		ListCell *l;
+		bool seen[COMPRESS_ALGO_COUNT] = {0,};
+		uint32 order[COMPRESS_ALGO_COUNT + 1] = {0,};
 
 		foreach(l, elemlist)
 		{
@@ -999,11 +993,10 @@ compression_validate_parameter(const char *name, const char *value, void **extra
 			{
 				struct config_enum_entry option = algo_options[i];
 
-				if (pg_strcasecmp(item, option.name) == 0 &&
-					seen[option.val - 1] == 0)
+				if (pg_strcasecmp(item, option.name) == 0 && !seen[option.val])
 				{
-					order[num] = option.val;
-					seen[option.val - 1] = ++num;
+					order[++order[0]] = option.val; /* We use first element to keep count */
+					seen[option.val] = true;
 					goto next;
 				}
 			}
@@ -1013,9 +1006,9 @@ compression_validate_parameter(const char *name, const char *value, void **extra
 next:;
 		}
 
-		if ((*extra = guc_malloc(LOG, COMPRESS_MAX_ID * sizeof(uint32))) != NULL)
+		if ((*extra = guc_malloc(LOG, (order[0] + 1) * sizeof(uint32))) != NULL)
 		{
-			memcpy(*extra, order, COMPRESS_MAX_ID * sizeof(uint32));
+			memcpy(*extra, order, (order[0] + 1) * sizeof(uint32));
 			ret = true;
 		}
 	}
@@ -1039,10 +1032,11 @@ compression_assign_hook(const char *newval, void *extra)
 {
 	uint32 *enabled = extra;
 
-	memcpy(pg_streampack_compression_order, enabled, COMPRESS_MAX_ID * sizeof(uint32));
-	memset(pg_streampack_compression_configured, 0, (COMPRESS_MAX_ID + 1) * sizeof(bool));
+	pg_streampack_compression_order_count = *enabled;
+	memcpy(pg_streampack_compression_order, enabled + 1, pg_streampack_compression_order_count * sizeof(uint32));
+	memset(pg_streampack_compression_configured, 0, COMPRESS_ALGO_COUNT * sizeof(bool));
 
-	for (size_t i = 0; i < COMPRESS_MAX_ID && enabled[i] > 0; i++)
+	for (size_t i = 1; i <= pg_streampack_compression_order_count; i++)
 		pg_streampack_compression_configured[enabled[i]] = true;
 }
 
@@ -1059,41 +1053,41 @@ compression_requested_assign_hook(const char *newval, void *extra)
 {
 	uint32 *requested = extra;
 
-	if (comp_ctx != NULL)
-	{
-		for (size_t i = 0; i < COMPRESS_MAX_ID && requested[i] > 0; i++)
-			if (pg_streampack_compression_configured[requested[i]])
-			{
-				switch (requested[i])
-				{
-					case COMPRESS_ZSTD:
-#ifdef USE_ZSTD
-						if (comp_ctx->zstd_stream != NULL)
-						{
-							free_comp_ctx_lz4(comp_ctx);
-							comp_ctx->compress = pg_streampack_compress_zstd;
-							elog(LOG_SERVER_ONLY, "Sending ZSTD compressed stream");
-						}
-#endif
-						break;
-					case COMPRESS_LZ4:
-#ifdef USE_LZ4
-						if (comp_ctx->lz4_stream != NULL)
-						{
-							free_comp_ctx_ztsd(comp_ctx);
-							comp_ctx->compress = pg_streampack_compress_lz4;
-							elog(LOG_SERVER_ONLY, "Sending LZ4 compressed stream");
-						}
-#endif
-						break;
-				}
-			}
+	if (comp_ctx == NULL)
+		return;
 
-		if (comp_ctx->compress == NULL)
+	for (size_t i = 1; i <= requested[0]; i++)
+		if (pg_streampack_compression_configured[requested[i]])
 		{
-			free_comp_ctx(comp_ctx);
-			comp_ctx = NULL;
+			switch (requested[i])
+			{
+				case COMPRESS_ZSTD:
+#ifdef USE_ZSTD
+					if (comp_ctx->zstd_stream != NULL)
+					{
+						free_comp_ctx_lz4(comp_ctx);
+						comp_ctx->compress = pg_streampack_compress_zstd;
+						elog(LOG_SERVER_ONLY, "Sending ZSTD compressed stream");
+					}
+#endif
+					break;
+				case COMPRESS_LZ4:
+#ifdef USE_LZ4
+					if (comp_ctx->lz4_stream != NULL)
+					{
+						free_comp_ctx_ztsd(comp_ctx);
+						comp_ctx->compress = pg_streampack_compress_lz4;
+						elog(LOG_SERVER_ONLY, "Sending LZ4 compressed stream");
+					}
+#endif
+					break;
+			}
 		}
+
+	if (comp_ctx->compress == NULL)
+	{
+		free_comp_ctx(comp_ctx);
+		comp_ctx = NULL;
 	}
 }
 
