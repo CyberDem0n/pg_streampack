@@ -15,6 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         postgres-version:
+          - '13'
           - '14'
           - '15'
           - '16'
@@ -27,6 +28,7 @@ jobs:
       run: |
         set -e
         sudo apt-get update -y
+        sudo apt-get remove man-db
         sudo apt-get install -y curl ca-certificates gnupg liblz4-dev libkrb5-dev libipc-run-perl
         sudo sh -c "echo \"deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main $PG\" > /etc/apt/sources.list.d/pgdg.list"
         sudo sh -c "curl -s -o - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg"
@@ -46,7 +48,16 @@ jobs:
 
     - name: Run tests
       run: |
-        make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck || (cat regression.diffs && false)
+        make PG_CONFIG=/usr/lib/postgresql/$PG/bin/pg_config USE_PGXS=1 installcheck PROVE_FLAGS='--verbose'
+
+    - name: Upload logs if test failed
+      uses: actions/upload-artifact@v4
+      if: failure()
+      with:
+        name: tap-tests-logs
+        path: tmp_check/log
+        if-no-files-found: error
+        retention-days: 5
 
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v5
