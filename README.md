@@ -10,9 +10,9 @@ Features
 --------
 
 - Transparent compression for replication streams
+  - Supports both physical and logical streaming replication
 - Uses streaming compression to obtain better compression ratios across sequential WAL traffic
 - Minimal configuration changes for existing replication setups
-- Works with streaming replication (physical and logical)
 - Unmodified clients that do **not** request compression continue to operate normally
 
 Installation
@@ -37,11 +37,17 @@ Example setting in postgresql.conf:
 
 Restart the servers after changing the configuration.
 
+The following values are supported for `pg_streampack.compression`:
+
+- `zstd` (requires PostgreSQL 15+ built with `--with-zstd`)
+- `lz4`  (requires PostgreSQL 14+ built with `--with-lz4`)
+
 Note. Module must be installed and added to `shared_preload_libraries` on both servers.
 
 Compatibility
 -------------
 
+- Works with both physical and logical streaming replication
 - By default supports the same compression algorithms that are supported by PostgreSQL major version:
 	- PostgreSQL 14+ - LZ4 (if PostgreSQL is compiled with `--with-lz4`)
 	- PostgreSQL 15+ - LZ4 and ZSTD (if PostgreSQL is compiled with `--with-lz4` and `--with-zstd`)
@@ -52,11 +58,12 @@ Compatibility
 Negotiation
 -----------
 
-`pg_streampack` only compresses replication stream messages when both the server and the client explicitly agree.
-There is no new network handshake or protocol command; instead, negotiation happens by sending `-c pg_streampack.requested=$pg_streampack.compression` via connection `options` if `pg_streampack.compression` GUC is set and valid.
-Upstream server prefers the algorithm which is earlier in the list recieved via `pg_streampack.requested` GUC.
-If either side doesn’t “opt in”, replication messages stay exactly as PostgreSQL normally sends them.
-The receiver detects compression by inspecting a flag bit in the `XLogData` header.
+`pg_streampack` only compresses replication stream messages when both sides explicitly agree.
+There is no new network handshake or protocol command; instead, negotiation happens by sending `-c pg_streampack.requested=<algorithms>` via connection `options`.
+The downstream (standby or logical subscriber) sends a list of supported algorithms (configured using `pg_streampack.compression` GUC) as a `pg_streampack.requested` GUC.
+The upstream (primary or publisher) chooses the first algorithm from the list that it also has enabled in its own `pg_streampack.compression` list.
+If no common algorithm is found, replication proceeds **uncompressed** (no error) with the original PostgreSQL replication messages format.
+The receiver/subscriber detects compression by inspecting a flag bit in the `XLogData` header.
 
 On-the-Wire Protocol Format Changes
 -----------------------------------
