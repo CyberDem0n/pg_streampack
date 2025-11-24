@@ -152,7 +152,7 @@ static compression_ctx *comp_ctx = NULL;
  * Hackery to inject ourselves into walsender's stream.
  */
 static ClientAuthentication_hook_type original_client_auth_hook = NULL;
-static const PQcommMethods *OldPqCommMethods;
+void (*old_putmessage_noblock) (char msgtype, const char *s, size_t len);
 
 static void
 free_comp_ctx_lz4(compression_ctx *ctx)
@@ -237,36 +237,6 @@ cleanup:
 	free_comp_ctx(ctx);
 
 	return NULL;
-}
-
-static void
-socket_comm_reset(void)
-{
-	OldPqCommMethods->comm_reset();
-}
-
-static int
-socket_flush(void)
-{
-	return OldPqCommMethods->flush();
-}
-
-static int
-socket_flush_if_writable(void)
-{
-	return OldPqCommMethods->flush_if_writable();
-}
-
-static bool
-socket_is_send_pending(void)
-{
-	return OldPqCommMethods->is_send_pending();
-}
-
-static int
-socket_putmessage(char msgtype, const char *s, size_t len)
-{
-	return OldPqCommMethods->putmessage(msgtype, s, len);
 }
 
 #if USE_LZ4 || USE_ZSTD
@@ -385,47 +355,15 @@ socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 		memcpy(&buf->data[ts_offset], &net_ts, sizeof(uint64));
 
 		/* call original function, which will actually send the message */
-		OldPqCommMethods->putmessage_noblock(msgtype, buf->data, buf->len);
+		old_putmessage_noblock(msgtype, buf->data, buf->len);
 		pg_atomic_fetch_add_u64(&stats->compressed, buf->len);
 		return;
 	}
 
 send_uncompressed:
-	OldPqCommMethods->putmessage_noblock(msgtype, s, len);
+	old_putmessage_noblock(msgtype, s, len);
 	pg_atomic_fetch_add_u64(&stats->uncompressed, len);
 }
-
-#if PG_VERSION_NUM < 140000
-static void
-socket_startcopyout(void)
-{
-	OldPqCommMethods->startcopyout();
-}
-
-static void
-socket_endcopyout(bool errorAbort)
-{
-	OldPqCommMethods->endcopyout(errorAbort);
-}
-#endif
-
-static
-#if PG_VERSION_NUM >= 120000
-const
-#endif
-PQcommMethods PqCommSocketMethods = {
-	socket_comm_reset,
-	socket_flush,
-	socket_flush_if_writable,
-	socket_is_send_pending,
-	socket_putmessage,
-	socket_putmessage_noblock
-#if PG_VERSION_NUM < 140000
-	,
-	socket_startcopyout,
-	socket_endcopyout
-#endif
-};
 
 static void
 on_exit_callback(int code, Datum arg)
@@ -436,6 +374,8 @@ on_exit_callback(int code, Datum arg)
 static void
 attach_to_walsender(Port *port, int status)
 {
+	PQcommMethods *PqCommSocketMethods;
+
 	/*
 	 * Any other plugins which use ClientAuthentication_hook.
 	 */
@@ -443,11 +383,14 @@ attach_to_walsender(Port *port, int status)
 		original_client_auth_hook(port, status);
 
 	if (pg_streampack_compression_order_count > 0 &&
-		am_walsender && (comp_ctx = init_comp_ctx()) != NULL)
+		am_walsender && (comp_ctx = init_comp_ctx()) != NULL &&
+		(PqCommSocketMethods = malloc(sizeof(PQcommMethods))) != NULL)
 	{
+		memcpy(PqCommSocketMethods, PqCommMethods, sizeof(PQcommMethods));
+		PqCommSocketMethods->putmessage_noblock = socket_putmessage_noblock;
 		on_proc_exit(on_exit_callback, 0);
-		OldPqCommMethods = PqCommMethods;
-		PqCommMethods = &PqCommSocketMethods;
+		old_putmessage_noblock = PqCommMethods->putmessage_noblock;
+		PqCommMethods = PqCommSocketMethods;
 	}
 }
 
