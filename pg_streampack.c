@@ -7,7 +7,6 @@
 #include <zstd.h>
 #endif
 
-#include "common/connect.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "libpq/libpq.h"
@@ -520,14 +519,55 @@ cleanup:
 	return NULL;
 }
 
-/*
- * Combination of libpqrcv_connect() and libpqrcv_check_conninfo() from
- * PostgreSQL 18, with small addition of compression "negotiation" which is
- * passed as GUC via options.
- *
- * Unfortunately it wasn't possible to use original function because it
- * overrides options provided inside conninfo string.
- */
+static char *
+conninfo_with_compression_request(const char *conninfo)
+{
+	PQExpBufferData buf;
+	char	   *errmsg = NULL;
+	const char *conn_options = NULL;
+
+	PQconninfoOption *opts = PQconninfoParse(conninfo, &errmsg);
+	if (opts == NULL)
+	{
+		if (errmsg)
+			PQfreemem(errmsg);
+		return NULL;
+	}
+
+	for (PQconninfoOption *opt = opts; opt->keyword != NULL; ++opt)
+		if (strcmp(opt->keyword, "options") == 0 && opt->val && *opt->val)
+			conn_options = opt->val;
+
+	initPQExpBuffer(&buf);
+	appendPQExpBufferStr(&buf, conninfo);
+	appendPQExpBufferStr(&buf, " options='");
+	if (conn_options)
+	{
+		for (const char *p = conn_options; *p; p++)
+		{
+			if (*p == '\'' || *p == '\\')
+				appendPQExpBufferChar(&buf, '\\');
+
+			appendPQExpBufferChar(&buf, *p);
+		}
+
+		appendPQExpBufferChar(&buf, ' ');
+	}
+	appendPQExpBufferStr(&buf, COMPRESSION_REQUEST_OPTION);
+	appendPQExpBufferStr(&buf, pg_streampack_compression_request());
+	appendPQExpBufferChar(&buf, '\'');
+
+	PQconninfoFree(opts);
+
+	if (PQExpBufferDataBroken(buf))
+	{
+		termPQExpBuffer(&buf);
+		return NULL;
+	}
+
+	return buf.data;
+}
+
 static WalReceiverConn *
 libpqrcv_connect(const char *conninfo,
 #if PG_VERSION_NUM >= 170000
@@ -540,193 +580,43 @@ libpqrcv_connect(const char *conninfo,
 				 const char *appname, char **err)
 {
 	WalReceiverConn *conn;
-	const char *keys[6];
-	const char *vals[6];
-	int			i = 0;
-	PQconninfoOption *opts = NULL;
-	char	   *options = NULL;
-	char	   *conn_options = NULL;
-#if PG_VERSION_NUM < 170000
-	bool		replication = true;
+	decompression_ctx *ctx = NULL;
+	char	   *modified_conninfo = NULL;
+
+	if (pg_streampack_compression_order_count > 0)
+		ctx = init_decomp_ctx();
+
+	if (ctx != NULL)
+	{
+		modified_conninfo = conninfo_with_compression_request(conninfo);
+		if (modified_conninfo != NULL)
+			conninfo = modified_conninfo;
+	}
+
+	conn = old_walrcv_connect(conninfo,
+#if PG_VERSION_NUM >= 170000
+							  replication,
 #endif
-#if PG_VERSION_NUM < 160000
-	bool		must_use_password = false;
+							  logical,
+#if PG_VERSION_NUM >= 160000
+							  must_use_password,
 #endif
-	bool		uses_password = false;
-	decompression_ctx *ctx = pg_streampack_compression_order_count > 0 ? init_decomp_ctx() : NULL;
+							  appname, err);
 
-	/*
-	 * We use the expand_dbname parameter to process the connection string (or
-	 * URI), and pass some extra options.
-	 */
-	keys[i] = "dbname";
-	vals[i] = conninfo;
+	if (modified_conninfo)
+		free(modified_conninfo);
 
-	/* We can not have logical without replication */
-	Assert(replication || !logical);
-
-	opts = PQconninfoParse(conninfo, err);
-	if (opts == NULL)
+	if (conn != NULL)
 	{
-		/* The error string is malloc'd, so we must free it explicitly */
-		char	   *errcopy = *err ? pstrdup(*err) : "out of memory";
-
-		PQfreemem(*err);
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("invalid connection string syntax: %s", errcopy)));
+		/* Extend allocation to fit our extra fields (decomp_ctx, streaming) */
+		conn = repalloc(conn, sizeof(WalReceiverConn));
+		conn->decomp_ctx = ctx;
+		conn->streaming = false;
 	}
-
-	for (PQconninfoOption *opt = opts; opt->keyword != NULL; ++opt)
-	{
-		/* Ignore connection options that are not present. */
-		if (opt->val == NULL)
-			continue;
-
-		if (strcmp(opt->keyword, "options") == 0 && opt->val[0] != '\0')
-			conn_options = opt->val;
-		else if (strcmp(opt->keyword, "password") == 0 && opt->val[0] != '\0')
-			uses_password = true;
-	}
-
-	if (must_use_password && !uses_password)
-	{
-		/* malloc'd, so we must free it explicitly */
-		PQconninfoFree(opts);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-				 errmsg("password is required"),
-				 errdetail("Non-superusers must provide a password in the connection string.")));
-	}
-
-	if (replication)
-	{
-		keys[++i] = "replication";
-		vals[i] = logical ? "database" : "true";
-
-		if (logical)
-		{
-			/* Tell the publisher to translate to our encoding */
-			keys[++i] = "client_encoding";
-			vals[i] = GetDatabaseEncodingName();
-
-			/*
-			 * Force assorted GUC parameters to settings that ensure that the
-			 * publisher will output data values in a form that is unambiguous
-			 * to the subscriber.  (We don't want to modify the subscriber's
-			 * GUC settings, since that might surprise user-defined code
-			 * running in the subscriber, such as triggers.)  This should
-			 * match what pg_dump does.
-			 */
-			if (ctx == NULL)
-			{
-				keys[++i] = "options";
-				vals[i] = LOGICAL_OPTIONS;
-			}
-			else
-				conn_options = LOGICAL_OPTIONS;
-		}
-		else
-		{
-			/*
-			 * The database name is ignored by the server in replication mode,
-			 * but specify "replication" for .pgpass lookup.
-			 */
-			keys[++i] = "dbname";
-			vals[i] = "replication";
-		}
-
-		if (ctx != NULL)
-		{
-			char *compression_request = pg_streampack_compression_request();
-
-			options = palloc0(1 + strlen(COMPRESSION_REQUEST_OPTION) +
-							  strlen(compression_request) +
-							  (conn_options ? strlen(conn_options) + 1 : 0));
-			if (conn_options)
-			{
-				strcpy(options, conn_options);
-				strcat(options, " ");
-			}
-			strcat(options, COMPRESSION_REQUEST_OPTION);
-			strcat(options, compression_request);
-
-			keys[++i] = "options";
-			vals[i] = options;
-		}
-	}
-
-	PQconninfoFree(opts);
-
-	keys[++i] = "fallback_application_name";
-	vals[i] = appname;
-
-	keys[++i] = NULL;
-	vals[i] = NULL;
-
-	Assert(i < lengthof(keys));
-
-	conn = palloc0(sizeof(WalReceiverConn));
-	conn->streamConn =
-		libpqsrv_connect_params(keys, vals,
-								 /* expand_dbname = */ true,
-								WAIT_EVENT_LIBPQWALRECEIVER_CONNECT);
-
-	if (options != NULL)
-		pfree(options);
-
-	if (PQstatus(conn->streamConn) != CONNECTION_OK)
-		goto bad_connection_errmsg;
-
-	if (must_use_password && !PQconnectionUsedPassword(conn->streamConn))
-	{
-		libpqsrv_disconnect(conn->streamConn);
-		pfree(conn);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-				 errmsg("password is required"),
-				 errdetail("Non-superuser cannot connect if the server does not request a password."),
-				 errhint("Target server's authentication method must be changed, or set password_required=false in the subscription parameters.")));
-	}
-
-	/*
-	 * Set always-secure search path for the cases where the connection is
-	 * used to run SQL queries, so malicious users can't get control.
-	 */
-	if (!replication || logical)
-	{
-		PGresult   *res;
-
-		res = libpqsrv_exec(conn->streamConn,
-							ALWAYS_SECURE_SEARCH_PATH_SQL,
-							WAIT_EVENT_LIBPQWALRECEIVER_RECEIVE);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			PQclear(res);
-			*err = psprintf(_("could not clear search path: %s"),
-							pchomp(PQerrorMessage(conn->streamConn)));
-			goto bad_connection;
-		}
-		PQclear(res);
-	}
-
-	conn->logical = logical;
-	conn->decomp_ctx = ctx;
+	else
+		free_decomp_ctx(ctx);
 
 	return conn;
-
-	/* error path, using libpq's error message */
-bad_connection_errmsg:
-	*err = pchomp(PQerrorMessage(conn->streamConn));
-
-	/* error path, error already set */
-bad_connection:
-	libpqsrv_disconnect(conn->streamConn);
-	pfree(conn);
-	free_decomp_ctx(ctx);
-	return NULL;
 }
 
 static bool
