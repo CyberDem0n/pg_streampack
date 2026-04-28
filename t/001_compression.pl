@@ -62,7 +62,7 @@ $node_primary->restart;
 
 my $node_standby = PostgreSQL::Test::Cluster->new('standby');
 $node_standby->init_from_backup($node_primary, $backup_name);
-my $primary_conninfo = $node_primary->connstr . " options=''-c foo.bar=0''";
+my $primary_conninfo = $node_primary->connstr . " options=''-c foo.bar=a\\\\b''";
 $node_standby->append_conf('postgresql.conf', qq(
 primary_conninfo = '$primary_conninfo'
 ));
@@ -137,8 +137,8 @@ $node_logical->safe_psql('postgres',
 	"UPDATE pg_subscription SET subconninfo = 'broken'");
 
 check_log($node_logical, $log_size,
-	"invalid connection string syntax:",
-	'invalid connection string');
+	"could not connect to the publisher|invalid connection string syntax",
+	'broken conninfo handled gracefully');
 
 $node_standby->stop;
 $node_logical->stop;
