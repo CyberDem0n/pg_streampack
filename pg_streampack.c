@@ -925,7 +925,7 @@ compression_requested_assign_hook(const char *newval, void *extra)
 }
 
 static Size
-memsize()
+memsize(void)
 {
 	Size size = MAXALIGN(sizeof(shared_compression_stats));
 	return size;
